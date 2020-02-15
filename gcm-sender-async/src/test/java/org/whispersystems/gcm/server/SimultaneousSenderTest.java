@@ -2,13 +2,14 @@ package org.whispersystems.gcm.server;
 
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import com.squareup.okhttp.mockwebserver.MockResponse;
+import com.squareup.okhttp.mockwebserver.SocketPolicy;
 import org.junit.Rule;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -16,14 +17,14 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import com.squareup.okhttp.mockwebserver.rule.MockWebServerRule;
 import static junit.framework.TestCase.assertTrue;
 import static org.whispersystems.gcm.server.util.FixtureHelpers.fixture;
 
 public class SimultaneousSenderTest {
 
   @Rule
-  public WireMockRule wireMock = new WireMockRule(8089);
+  public MockWebServerRule webserverRule = new MockWebServerRule();
 
   private static final ObjectMapper mapper = new ObjectMapper();
 
@@ -34,23 +35,22 @@ public class SimultaneousSenderTest {
   }
 
   @Test
-  public void testSimultaneousSuccess() throws TimeoutException, InterruptedException, ExecutionException, JsonProcessingException {
-    stubFor(post(urlPathEqualTo("/gcm/send"))
-                .willReturn(aResponse()
-                                .withStatus(200)
-                                .withBody(fixture("fixtures/response-success.json"))));
+  public void testSimultaneousSuccess() throws TimeoutException, InterruptedException, ExecutionException, IOException {
+    int requestCount = 1000;
+    var body = fixture("fixtures/response-success.json");
+    for (int i = 0; i < requestCount*2; i++) {
+      webserverRule.enqueue(new MockResponse().setResponseCode(200).setBody(body));
+    }
 
-    Sender                          sender  = new Sender("foobarbaz", mapper, 2, "http://localhost:8089/gcm/send");
+    Sender                          sender  = new Sender("foobarbaz", mapper, 2, httpURL());
     List<CompletableFuture<Result>> results = new LinkedList<>();
 
-    for (int i=0;i<1000;i++) {
+    for (int i = 0; i < requestCount; i++) {
       results.add(sender.send(Message.newBuilder().withDestination("1").build()));
     }
 
-    int i=0;
     for (CompletableFuture<Result> future : results) {
       Result result = future.get(60, TimeUnit.SECONDS);
-      System.out.println("Got " + (i++));
 
       if (!result.isSuccess()) {
         throw new AssertionError(result.getError());
@@ -60,23 +60,32 @@ public class SimultaneousSenderTest {
 
   @Test
   public void testSimultaneousFailure() throws TimeoutException, InterruptedException {
-    stubFor(post(urlPathEqualTo("/gcm/send"))
-                .willReturn(aResponse()
-                                .withStatus(503)));
+    int requestCount = 1000;
+    for (int i = 0; i < requestCount*2; i++) {
+      webserverRule.enqueue(new MockResponse().setResponseCode(503));
+    }
 
-    Sender                         sender   = new Sender("foobarbaz", mapper, 2, "http://localhost:8089/gcm/send");
+    Sender sender = new Sender("foobarbaz", mapper, 2, httpURL());
     List<CompletableFuture<Result>> futures = new LinkedList<>();
 
-    for (int i=0;i<1000;i++) {
+    for (int i = 0; i< requestCount; i++) {
       futures.add(sender.send(Message.newBuilder().withDestination("1").build()));
     }
 
+    int i=0;
     for (CompletableFuture<Result> future : futures) {
       try {
+        System.out.printf("Got %d\n", i);
         Result result = future.get(60, TimeUnit.SECONDS);
       } catch (ExecutionException e) {
         assertTrue(e.getCause().toString(), e.getCause() instanceof ServerFailedException);
       }
+      i++;
     }
   }
+
+  private String httpURL() {
+    return webserverRule.getUrl("/gcm/send").toString();
+  }
+
 }
